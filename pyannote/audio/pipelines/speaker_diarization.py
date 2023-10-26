@@ -601,6 +601,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
             diff = len(diarization.labels()) - len(centroids)
             centroids = list(centroids)
             centroids.extend([centroids[-1]] * diff)
+            centroids = np.array(centroids) 
             centroids = centroids[
                 [inverse_mapping[label] for label in diarization.labels()]
             ]
