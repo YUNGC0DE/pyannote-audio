@@ -591,9 +591,20 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         # re-order centroids so that they match
         # the order given by diarization.labels()
         inverse_mapping = {label: index for index, label in mapping.items()}
-        centroids = centroids[
-            [inverse_mapping[label] for label in diarization.labels()]
-        ]
+        try:
+            centroids = centroids[
+                [inverse_mapping[label] for label in diarization.labels()]
+            ]
+        except IndexError as exc:
+            print(exc)
+            
+            diff = len(diarization.labels()) - len(centroids)
+            centroids = list(centroids)
+            centroids.extend([centroids[-1]] * diff)
+            centroids = centroids[
+                [inverse_mapping[label] for label in diarization.labels()]
+            ]
+        
 
         # FIXME: the number of centroids may be smaller than the number of speakers
         # in the annotation. This can happen if the number of active speakers
