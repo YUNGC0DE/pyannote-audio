@@ -443,14 +443,7 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
         if device.type == "cpu":
             providers = ["CPUExecutionProvider"]
         elif device.type == "cuda":
-            providers = [
-                (
-                    "CUDAExecutionProvider",
-                    {
-                        "cudnn_conv_algo_search": "DEFAULT",  # EXHAUSTIVE / HEURISTIC / DEFAULT
-                    },
-                )
-            ]
+            providers = ["CUDAExecutionProvider"]
         else:
             warnings.warn(
                 f"Unsupported device type: {device.type}, falling back to CPU"
