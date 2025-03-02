@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Text, Union
 
 import torch
+import torch.nn as nn
 import yaml
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import RepositoryNotFoundError
@@ -68,7 +69,8 @@ class Pipeline(_Pipeline):
             to True or to a string containing your hugginface.co authentication
             token that can be obtained by running `huggingface-cli login`
         cache_dir: Path or str, optional
-            Path to model cache directory. Defauorch/pyannote" when unset.
+            Path to model cache directory. Defaults to content of PYANNOTE_CACHE
+            environment variable, or "~/.cache/torch/pyannote" when unset.
         """
 
         checkpoint_path = str(checkpoint_path)
@@ -232,7 +234,7 @@ visit https://hf.co/{model_id} to accept the user conditions."""
         _models = self.__dict__.get("_models")
         _inferences = self.__dict__.get("_inferences")
 
-        if isinstance(value, Model):
+        if isinstance(value, nn.Module):
             if _models is None:
                 msg = "cannot assign models before Pipeline.__init__() call"
                 raise AttributeError(msg)
