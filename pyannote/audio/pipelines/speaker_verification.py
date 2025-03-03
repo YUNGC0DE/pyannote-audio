@@ -452,8 +452,8 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
             providers = ["CPUExecutionProvider"]
 
         sess_options = ort.SessionOptions()
-        sess_options.inter_op_num_threads = 1
-        sess_options.intra_op_num_threads = 1
+        sess_options.inter_op_num_threads = 4
+        sess_options.intra_op_num_threads = 4
         self.session_ = ort.InferenceSession(
             self.embedding, sess_options=sess_options, providers=providers
         )
