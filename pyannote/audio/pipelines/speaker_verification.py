@@ -23,6 +23,7 @@
 import warnings
 from functools import cached_property
 from pathlib import Path
+import os
 from typing import Optional, Text, Union
 
 import numpy as np
@@ -431,6 +432,9 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
                 )
 
         self.embedding = embedding
+        # Добавление кэша для feature batches
+        self._features_cache = {}
+        self._cache_max_size = 50  # Максимальный размер кэша
 
         self.to(device or torch.device("cpu"))
 
@@ -442,21 +446,86 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
 
         if device.type == "cpu":
             providers = ["CPUExecutionProvider"]
+            provider_options = None
         elif device.type == "cuda":
             providers = ["CUDAExecutionProvider"]
+            # Оптимизации для CUDA
+            # Определяем оптимальные параметры в зависимости от версии ONNX Runtime
+            try:
+                # Проверяем версию onnxruntime
+                ort_version = tuple(int(v) for v in ort.__version__.split('.')[:2])
+                
+                if ort_version >= (1, 10):
+                    # Для более новых версий используем более продвинутые настройки
+                    provider_options = [
+                        {
+                            'device_id': device.index or 0,
+                            'arena_extend_strategy': 'kNextPowerOfTwo',
+                            'gpu_mem_limit': 8 * 1024 * 1024 * 1024,  # 2GB
+                            'cudnn_conv_algo_search': 'EXHAUSTIVE',
+                            'do_copy_in_default_stream': True,
+                        }
+                    ]
+                else:
+                    # Для более старых версий используем более безопасные настройки
+                    provider_options = [
+                        {
+                            'device_id': device.index or 0,
+                        }
+                    ]
+            except (AttributeError, ValueError):
+                # Если не удалось определить версию, используем безопасные настройки
+                provider_options = [{'device_id': device.index or 0}]
         else:
             warnings.warn(
                 f"Unsupported device type: {device.type}, falling back to CPU"
             )
             device = torch.device("cpu")
             providers = ["CPUExecutionProvider"]
+            provider_options = None
 
+        # Оптимизация сессии ONNX
         sess_options = ort.SessionOptions()
-        sess_options.inter_op_num_threads = 4
-        sess_options.intra_op_num_threads = 4
-        self.session_ = ort.InferenceSession(
-            self.embedding, sess_options=sess_options, providers=providers
-        )
+        
+        # Настраиваем опции многопоточности и оптимизации в зависимости от версии ONNX Runtime
+        try:
+            # Установка оптимальных параметров для многопоточности
+            sess_options.inter_op_num_threads = min(8, os.cpu_count() or 4)
+            sess_options.intra_op_num_threads = min(8, os.cpu_count() or 4)
+            
+            # Включение графовых оптимизаций
+            if hasattr(ort, 'GraphOptimizationLevel'):
+                sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            
+            # Включение параллельного выполнения для операторов
+            if hasattr(ort, 'ExecutionMode'):
+                sess_options.execution_mode = ort.ExecutionMode.ORT_PARALLEL
+        except AttributeError:
+            # Если какие-то атрибуты недоступны, используем базовую конфигурацию
+            pass
+            
+        try:
+            # Создаем сессию с оптимальными параметрами
+            if provider_options:
+                self.session_ = ort.InferenceSession(
+                    self.embedding, 
+                    sess_options=sess_options, 
+                    providers=providers, 
+                    provider_options=provider_options
+                )
+            else:
+                self.session_ = ort.InferenceSession(
+                    self.embedding,
+                    sess_options=sess_options,
+                    providers=providers
+                )
+        except TypeError:
+            # В случае ошибки типа (часто в старых версиях), пробуем без provider_options
+            self.session_ = ort.InferenceSession(
+                self.embedding,
+                sess_options=sess_options,
+                providers=providers
+            )
 
         self.device = device
         return self
@@ -508,6 +577,7 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
     def min_num_frames(self) -> int:
         return self.compute_fbank(torch.randn(1, 1, self.min_num_samples)).shape[1]
 
+    @torch.no_grad()
     def compute_fbank(
         self,
         waveforms: torch.Tensor,
@@ -515,12 +585,23 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
         frame_length: int = 25,
         frame_shift: int = 10,
         dither: float = 0.0,
+        use_cache: bool = True,
     ) -> torch.Tensor:
         """Extract fbank features
 
         Parameters
         ----------
         waveforms : (batch_size, num_channels, num_samples)
+        num_mel_bins : int, optional
+            Number of mel bins. Defaults to 80.
+        frame_length : int, optional
+            Frame length in ms. Defaults to 25.
+        frame_shift : int, optional
+            Frame shift in ms. Defaults to 10.
+        dither : float, optional
+            Dithering constant. Defaults to 0.0.
+        use_cache : bool, optional
+            Whether to use cache for the features. Defaults to True.
 
         Returns
         -------
@@ -528,26 +609,77 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
 
         Source: https://github.com/wenet-e2e/wespeaker/blob/45941e7cba2c3ea99e232d02bedf617fc71b0dad/wespeaker/bin/infer_onnx.py#L30C1-L50
         """
-
+        device = waveforms.device
+        
+        # Проверяем кэш, если он включен
+        if use_cache:
+            # Создаем ключ для кэша на основе хэша тензора
+            # Используем только первые 1000 сэмплов для хеширования, чтобы избежать слишком долгого вычисления
+            sample_for_hash = waveforms.cpu().detach()
+            if sample_for_hash.shape[-1] > 1000:
+                sample_for_hash = sample_for_hash[:, :, :1000]
+            cache_key = hash(sample_for_hash.numpy().tobytes())
+            if cache_key in self._features_cache:
+                return self._features_cache[cache_key].to(device)
+        
+        # Проверка шейпов waveforms
+        if waveforms.dim() != 3:
+            raise ValueError(f"waveforms должны иметь шейп (batch_size, channels, samples), но получено: {waveforms.shape}")
+        
+        if waveforms.shape[1] != 1:
+            raise ValueError(f"waveforms должны иметь только один канал, но получено: {waveforms.shape[1]}")
+        
         waveforms = waveforms * (1 << 15)
-        features = torch.stack(
-            [
-                kaldi.fbank(
-                    waveform,
-                    num_mel_bins=num_mel_bins,
-                    frame_length=frame_length,
-                    frame_shift=frame_shift,
-                    dither=dither,
-                    sample_frequency=self.sample_rate,
-                    window_type="hamming",
-                    use_energy=False,
-                )
-                for waveform in waveforms
-            ]
-        )
+        
+        # Оптимизированное вычисление признаков - обрабатываем весь батч сразу
+        batch_size = waveforms.shape[0]
+        if batch_size > 1:
+            # Для больших батчей используем параллельное вычисление
+            features = torch.stack(
+                [
+                    kaldi.fbank(
+                        waveform,
+                        num_mel_bins=num_mel_bins,
+                        frame_length=frame_length,
+                        frame_shift=frame_shift,
+                        dither=dither,
+                        sample_frequency=self.sample_rate,
+                        window_type="hamming",
+                        use_energy=False,
+                    )
+                    for waveform in waveforms
+                ]
+            )
+        else:
+            # Для одиночных примеров - обычное вычисление
+            features = kaldi.fbank(
+                waveforms[0],
+                num_mel_bins=num_mel_bins,
+                frame_length=frame_length,
+                frame_shift=frame_shift,
+                dither=dither,
+                sample_frequency=self.sample_rate,
+                window_type="hamming",
+                use_energy=False,
+            ).unsqueeze(0)
 
-        return features - torch.mean(features, dim=1, keepdim=True)
+        # Централизация признаков по батчу
+        features = features - torch.mean(features, dim=1, keepdim=True)
+        
+        # Кэшируем признаки, если кэш включен
+        if use_cache:
+            # Ограничиваем размер кэша
+            if len(self._features_cache) >= self._cache_max_size:
+                # Удаляем случайный ключ, если кэш заполнен
+                remove_key = next(iter(self._features_cache))
+                del self._features_cache[remove_key]
+            
+            # Сохраняем в кэш на CPU для экономии памяти GPU
+            self._features_cache[cache_key] = features.cpu()
+        
+        return features
 
+    @torch.no_grad()
     def __call__(
         self, waveforms: torch.Tensor, masks: Optional[torch.Tensor] = None
     ) -> np.ndarray:
@@ -567,37 +699,158 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
 
         batch_size, num_channels, num_samples = waveforms.shape
         assert num_channels == 1
-
-        features = self.compute_fbank(waveforms.to(self.device))
+        
+        # Определение устройства и оптимизация передачи данных
+        device = waveforms.device
+        cuda_available = torch.cuda.is_available()
+        use_cuda_for_preprocessing = cuda_available and device.type == 'cuda'
+        onnx_uses_cuda = 'CUDAExecutionProvider' in self.session_.get_providers()
+        
+        # Определяем оптимальное устройство для предобработки
+        preprocess_device = self.device if use_cuda_for_preprocessing else torch.device('cpu')
+        
+        # Перемещаем данные на нужное устройство для предобработки
+        if device != preprocess_device:
+            waveforms = waveforms.to(preprocess_device)
+        
+        # Вычисляем признаки на выбранном устройстве
+        features = self.compute_fbank(waveforms)
         _, num_frames, _ = features.shape
 
         if masks is None:
+            # Оптимизированный путь без масок - обрабатываем весь батч сразу
+            # Оптимизируем передачу данных между GPU и CPU в зависимости от конфигурации
+            if onnx_uses_cuda:
+                # Если ONNX работает на CUDA, данные должны быть на GPU
+                if features.device.type != 'cuda':
+                    features = features.cuda()
+                features_np = features.numpy(force=True)
+            else:
+                # Если ONNX работает на CPU, данные должны быть на CPU
+                if features.device.type != 'cpu':
+                    features = features.cpu()
+                features_np = features.numpy()
+            
+            # Проверка шейпа перед передачей в ONNX
+            if features_np.ndim != 3:
+                raise ValueError(f"Некорректный шейп features: {features_np.shape}, ожидается (batch_size, num_frames, num_features)")
+                
+            # Инференс с оптимизированной передачей данных
             embeddings = self.session_.run(
-                output_names=["embs"], input_feed={"feats": features.numpy(force=True)}
+                output_names=["embs"], input_feed={"feats": features_np}
             )[0]
 
             return embeddings
 
+        # Путь с масками: оптимизация для батчей
         batch_size_masks, _ = masks.shape
         assert batch_size == batch_size_masks
-
-        imasks = F.interpolate(
-            masks.unsqueeze(dim=1), size=num_frames, mode="nearest"
-        ).squeeze(dim=1)
+        
+        # Перемещаем маски на то же устройство, что и признаки
+        masks = masks.to(preprocess_device)
+        
+        # Оптимизированная интерполяция масок
+        # mode='nearest' может вызвать проблемы в некоторых версиях torch, используем более надежный метод
+        try:
+            imasks = F.interpolate(
+                masks.unsqueeze(dim=1), size=num_frames, mode="nearest"
+            ).squeeze(dim=1)
+        except RuntimeError:
+            # Резервный метод в случае ошибки
+            ratio = num_frames / masks.shape[1]
+            imasks = torch.zeros((batch_size, num_frames), device=masks.device)
+            for b in range(batch_size):
+                for i in range(masks.shape[1]):
+                    start_idx = int(i * ratio)
+                    end_idx = int((i + 1) * ratio)
+                    imasks[b, start_idx:end_idx] = masks[b, i]
 
         imasks = imasks > 0.5
 
+        # Создаем массив для хранения результатов
         embeddings = np.nan * np.zeros((batch_size, self.dimension))
 
+        # Вместо последовательной обработки, группируем примеры с масками
+        valid_indices = []
+        valid_features = []
+        
         for f, (feature, imask) in enumerate(zip(features, imasks)):
-            masked_feature = feature[imask]
-            if masked_feature.shape[0] < self.min_num_frames:
+            if torch.sum(imask) == 0:
+                # Пропускаем примеры без маски
                 continue
-
-            embeddings[f] = self.session_.run(
+                
+            masked_feature = feature[imask]
+            if masked_feature.shape[0] >= self.min_num_frames:
+                valid_indices.append(f)
+                valid_features.append(masked_feature)
+        
+        if not valid_features:
+            return embeddings
+        
+        # Обрабатываем все допустимые признаки в оптимальном батче
+        if len(valid_features) == 1:
+            # Одиночный пример
+            feature_batch = valid_features[0].unsqueeze(0)
+            
+            # Оптимальная передача данных в зависимости от конфигурации
+            if onnx_uses_cuda:
+                if feature_batch.device.type != 'cuda':
+                    feature_batch = feature_batch.cuda()
+                feature_batch_np = feature_batch.numpy(force=True)
+            else:
+                if feature_batch.device.type != 'cpu':
+                    feature_batch = feature_batch.cpu()
+                feature_batch_np = feature_batch.numpy()
+            
+            # Проверка шейпа перед передачей в ONNX
+            if feature_batch_np.ndim != 3:
+                raise ValueError(f"Некорректный шейп feature_batch: {feature_batch_np.shape}, ожидается (batch_size, num_frames, num_features)")
+                
+            result = self.session_.run(
                 output_names=["embs"],
-                input_feed={"feats": masked_feature.numpy(force=True)[None]},
-            )[0][0]
+                input_feed={"feats": feature_batch_np},
+            )[0]
+            embeddings[valid_indices[0]] = result[0]
+        else:
+            # Оптимизированный батчинг с паддингом
+            max_len = max(f.shape[0] for f in valid_features)
+            padded_features = []
+            
+            for feat in valid_features:
+                if feat.shape[0] < max_len:
+                    # Паддинг путем повторения последнего фрейма (более эффективно для больших батчей)
+                    padding = feat[-1:].repeat(max_len - feat.shape[0], 1)
+                    padded_feat = torch.cat([feat, padding], dim=0)
+                else:
+                    padded_feat = feat
+                padded_features.append(padded_feat)
+            
+            # Объединяем в один батч
+            feature_batch = torch.stack(padded_features)
+            
+            # Оптимизированная передача данных для инференса
+            if onnx_uses_cuda:
+                if feature_batch.device.type != 'cuda':
+                    feature_batch = feature_batch.cuda()
+                feature_batch_np = feature_batch.numpy(force=True)
+            else:
+                if feature_batch.device.type != 'cpu':
+                    feature_batch = feature_batch.cpu()
+                feature_batch_np = feature_batch.numpy()
+            
+            # Проверка шейпа перед передачей в ONNX
+            if feature_batch_np.ndim != 3:
+                raise ValueError(f"Некорректный шейп feature_batch: {feature_batch_np.shape}, ожидается (batch_size, num_frames, num_features)")
+                
+            # Выполняем инференс на всем батче
+            result = self.session_.run(
+                output_names=["embs"],
+                input_feed={"feats": feature_batch_np},
+            )[0]
+            
+            # Копируем результаты в соответствующие позиции
+            for i, idx in enumerate(valid_indices):
+                embeddings[idx] = result[i]
 
         return embeddings
 

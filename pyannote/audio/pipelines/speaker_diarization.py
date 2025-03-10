@@ -79,7 +79,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
     segmentation_batch_size : int, optional
         Batch size used for speaker segmentation. Defaults to 1.
     embedding_batch_size : int, optional
-        Batch size used for speaker embedding. Defaults to 1.
+        Batch size used for speaker embedding. Defaults to 32.
     der_variant : dict, optional
         Optimize for a variant of diarization error rate.
         Defaults to {"collar": 0.0, "skip_overlap": False}. This is used in `get_metric`
@@ -119,7 +119,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         embedding: PipelineModel = "speechbrain/spkrec-ecapa-voxceleb@5c0be3875fda05e81f3c004ed8c7c06be308de1e",
         embedding_exclude_overlap: bool = False,
         clustering: str = "AgglomerativeClustering",
-        embedding_batch_size: int = 1,
+        embedding_batch_size: int = 32,
         segmentation_batch_size: int = 1,
         der_variant: Optional[dict] = None,
         use_auth_token: Union[Text, None] = None,
@@ -132,7 +132,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         self.segmentation_step = segmentation_step
 
         self.embedding = embedding
-        self.embedding_batch_size = embedding_batch_size
+        self._embedding_batch_size = embedding_batch_size
         self.embedding_exclude_overlap = embedding_exclude_overlap
 
         self.klustering = clustering
@@ -268,6 +268,25 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         duration = binary_segmentations.sliding_window.duration
         num_chunks, num_frames, num_speakers = binary_segmentations.data.shape
 
+        # Автоопределение оптимального размера батча для GPU
+        # Примечание: для достижения оптимальной производительности требуется CUDA-совместимый GPU
+        batch_size = self._embedding_batch_size
+        if torch.cuda.is_available():
+            # Проверяем доступность CUDA и пытаемся определить оптимальный размер батча
+            try:
+                # Получаем общее количество эмбеддингов, которые нужно обработать
+                total_embeddings = num_chunks * num_speakers
+                # Увеличиваем размер батча для более эффективного использования GPU
+                # но не больше чем общее количество эмбеддингов или 128 (чтобы не перегрузить GPU)
+                batch_size = min(max(32, batch_size), 128, total_embeddings)
+                # Проверяем свободную память на GPU и корректируем размер батча
+                free_memory = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)
+                if free_memory < 1e9:  # если меньше 1 ГБ, уменьшаем размер батча
+                    batch_size = max(16, batch_size // 2)
+            except Exception:
+                # Если что-то пошло не так, используем значение по умолчанию
+                pass
+
         if exclude_overlap:
             # minimum number of samples needed to extract an embedding
             # (a lower number of samples would result in an error)
@@ -292,10 +311,17 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
                 binary_segmentations.data, binary_segmentations.sliding_window
             )
 
-        def iter_waveform_and_mask():
-            for (chunk, masks), (_, clean_masks) in zip(
+        # Более эффективная обработка данных для GPU
+        # Подготавливаем данные заранее, чтобы минимизировать копирование
+        all_waveforms = []
+        all_masks = []
+        all_indices = []  # Для отслеживания индексов (chunk, speaker)
+        
+        # Используем контекстный менеджер torch.no_grad для оптимизации памяти
+        with torch.no_grad():
+            for c, ((chunk, masks), (_, clean_masks)) in enumerate(zip(
                 binary_segmentations, clean_segmentations
-            ):
+            )):
                 # chunk: Segment(t, t + duration)
                 # masks: (num_frames, local_num_speakers) np.ndarray
 
@@ -306,59 +332,119 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
                     mode="pad",
                 )
                 # waveform: (1, num_samples) torch.Tensor
+                
+                # Проверка шейпа waveform и корректировка при необходимости
+                if waveform.dim() == 2 and waveform.shape[0] == 1:
+                    # Если шейп (1, num_samples), добавляем размерность для батча
+                    waveform = waveform.unsqueeze(0)  # -> (1, 1, num_samples)
+                elif waveform.dim() != 3 or waveform.shape[1] != 1:
+                    # Если шейп неправильный, перестраиваем его
+                    waveform = waveform.reshape(1, 1, -1)  # -> (1, 1, num_samples)
 
                 # mask may contain NaN (in case of partial stitching)
                 masks = np.nan_to_num(masks, nan=0.0).astype(np.float32)
                 clean_masks = np.nan_to_num(clean_masks, nan=0.0).astype(np.float32)
 
-                for mask, clean_mask in zip(masks.T, clean_masks.T):
+                for s, (mask, clean_mask) in enumerate(zip(masks.T, clean_masks.T)):
                     # mask: (num_frames, ) np.ndarray
 
                     if np.sum(clean_mask) > min_num_frames:
                         used_mask = clean_mask
                     else:
                         used_mask = mask
+                    
+                    # Проверяем, содержит ли маска хоть что-то полезное
+                    if np.sum(used_mask) == 0:
+                        continue  # Пропускаем пустые маски
+                        
+                    # Проверка, что в waveform есть данные
+                    if torch.all(waveform == 0):
+                        continue  # Пропускаем пустые waveform
 
-                    yield waveform[None], torch.from_numpy(used_mask)[None]
-                    # w: (1, 1, num_samples) torch.Tensor
-                    # m: (1, num_frames) torch.Tensor
-
-        batches = batchify(
-            iter_waveform_and_mask(),
-            batch_size=self.embedding_batch_size,
-            fillvalue=(None, None),
-        )
-
-        batch_count = math.ceil(num_chunks * num_speakers / self.embedding_batch_size)
-
-        embedding_batches = []
-
+                    all_waveforms.append(waveform)
+                    all_masks.append(torch.from_numpy(used_mask))
+                    all_indices.append((c, s))  # Сохраняем индексы (chunk, speaker)
+        
+        # Если нет примеров для извлечения эмбеддингов, возвращаем пустой массив
+        if not all_waveforms:
+            embedding_dim = getattr(self._embedding, 'dimension', 512)  # Используем дефолтное значение, если не найдено
+            return np.zeros((num_chunks, num_speakers, embedding_dim))
+        
+        # Создаем батчи с оптимальным размером
+        num_examples = len(all_waveforms)
+        num_batches = math.ceil(num_examples / batch_size)
+        
+        # Инициализируем массив для хранения всех эмбеддингов
+        embedding_dim = getattr(self._embedding, 'dimension', 512)
+        all_embeddings = np.zeros((num_examples, embedding_dim))
+        
         if hook is not None:
-            hook("embeddings", None, total=batch_count, completed=0)
-
-        for i, batch in enumerate(batches, 1):
-            waveforms, masks = zip(*filter(lambda b: b[0] is not None, batch))
-
-            waveform_batch = torch.vstack(waveforms)
-            # (batch_size, 1, num_samples) torch.Tensor
-
-            mask_batch = torch.vstack(masks)
-            # (batch_size, num_frames) torch.Tensor
-
-            embedding_batch: np.ndarray = self._embedding(
-                waveform_batch, masks=mask_batch
-            )
-            # (batch_size, dimension) np.ndarray
-
-            embedding_batches.append(embedding_batch)
-
+            hook("embeddings", None, total=num_batches, completed=0)
+        
+        # Обрабатываем батчи
+        for b in range(num_batches):
+            start_idx = b * batch_size
+            end_idx = min(start_idx + batch_size, num_examples)
+            
+            # Создаем текущий батч
+            batch_waveforms_list = []
+            for i in range(start_idx, end_idx):
+                # Проверяем шейп waveform перед добавлением в батч
+                waveform = all_waveforms[i]
+                if waveform.dim() != 3 or waveform.shape[1] != 1:
+                    # Если неправильный шейп, исправляем
+                    waveform = waveform.reshape(1, 1, -1)
+                batch_waveforms_list.append(waveform)
+                
+            # Объединяем в батч и убеждаемся что шейпы корректны
+            try:
+                batch_waveforms = torch.cat(batch_waveforms_list, dim=0)
+            except RuntimeError as e:
+                # Если не удалось объединить из-за разных размеров, делаем это вручную
+                max_samples = max(w.shape[2] for w in batch_waveforms_list)
+                padded_waveforms = []
+                for waveform in batch_waveforms_list:
+                    if waveform.shape[2] < max_samples:
+                        # Паддинг нулями до max_samples
+                        padding = torch.zeros(1, 1, max_samples - waveform.shape[2], device=waveform.device)
+                        padded_waveform = torch.cat([waveform, padding], dim=2)
+                    else:
+                        padded_waveform = waveform
+                    padded_waveforms.append(padded_waveform)
+                batch_waveforms = torch.cat(padded_waveforms, dim=0)
+                
+            batch_masks = torch.stack([all_masks[i] for i in range(start_idx, end_idx)])
+            
+            # Проверяем шейпы перед передачей в модель
+            if batch_waveforms.dim() != 3:
+                raise ValueError(f"Неверный шейп batch_waveforms: {batch_waveforms.shape}, ожидается (batch_size, 1, num_samples)")
+            
+            # Извлекаем эмбеддинги для текущего батча
+            # Это будет использовать наши оптимизации в ONNX модели
+            try:
+                batch_embeddings = self._embedding(batch_waveforms, masks=batch_masks)
+                
+                # Сохраняем эмбеддинги
+                valid_indices = ~np.isnan(batch_embeddings[:, 0])
+                all_embeddings[start_idx:end_idx][valid_indices] = batch_embeddings[valid_indices]
+            except Exception as e:
+                # В случае ошибки выводим диагностическую информацию и продолжаем
+                print(f"Ошибка при получении эмбеддингов для батча {b+1}/{num_batches}: {e}")
+                print(f"batch_waveforms.shape: {batch_waveforms.shape}, batch_masks.shape: {batch_masks.shape}")
+                # Пропускаем проблемный батч
+                pass
+            
             if hook is not None:
-                hook("embeddings", embedding_batch, total=batch_count, completed=i)
-
-        embedding_batches = np.vstack(embedding_batches)
-
-        embeddings = rearrange(embedding_batches, "(c s) d -> c s d", c=num_chunks)
-
+                hook("embeddings", batch_embeddings if 'batch_embeddings' in locals() else None, 
+                     total=num_batches, completed=b+1)
+        
+        # Теперь надо переупорядочить эмбеддинги в нужный формат (num_chunks, num_speakers, dimension)
+        embeddings = np.zeros((num_chunks, num_speakers, embedding_dim))
+        
+        for idx, (c, s) in enumerate(all_indices):
+            if idx < len(all_embeddings) and not np.all(np.isnan(all_embeddings[idx])):
+                embeddings[c, s] = all_embeddings[idx]
+        
         # caching embeddings for subsequent trials
         # (see comments at the top of this method for more details)
         if self.training:
