@@ -423,8 +423,8 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
         device: Optional[torch.device] = None,
         inter_op_num_threads: int = 4,
         intra_op_num_threads: int = 4,
-        execution_mode: int = 1,  # 0: sequential, 1: parallel
-        graph_optimization_level: int = 99,  # 0: disable, 1: basic, 2: extended, 99: all
+        execution_mode = ort.ExecutionMode.ORT_PARALLEL,  # Используем перечисление вместо числа
+        graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL,  # Используем перечисление вместо числа
         enable_profiling: bool = False,
     ):
         if not ONNX_IS_AVAILABLE:
@@ -463,7 +463,15 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
         if device.type == "cpu":
             providers = ["CPUExecutionProvider"]
         elif device.type == "cuda":
-            providers = ["CUDAExecutionProvider"]
+            # Добавляем параметры для CUDA провайдера
+            cuda_provider_options = {
+                "device_id": device.index or 0,
+                "arena_extend_strategy": "kNextPowerOfTwo",
+                "gpu_mem_limit": 12 * 1024 * 1024 * 1024,  # 2GB
+                "cudnn_conv_algo_search": "EXHAUSTIVE",
+                "do_copy_in_default_stream": True,
+            }
+            providers = [("CUDAExecutionProvider", cuda_provider_options)]
         else:
             warnings.warn(
                 f"Unsupported device type: {device.type}, falling back to CPU"
@@ -474,7 +482,7 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
         sess_options = ort.SessionOptions()
         sess_options.inter_op_num_threads = self.inter_op_num_threads
         sess_options.intra_op_num_threads = self.intra_op_num_threads
-        sess_options.execution_mode = ort.ExecutionMode.ORT_PARALLEL if self.execution_mode == 1 else ort.ExecutionMode.ORT_SEQUENTIAL
+        sess_options.execution_mode = self.execution_mode
         sess_options.graph_optimization_level = self.graph_optimization_level
         sess_options.enable_profiling = self.enable_profiling
         
@@ -600,14 +608,47 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
         features = self.compute_fbank(waveforms.to(self.device))
         _, num_frames, _ = features.shape
 
+        # Создаем массив для результатов
+        embeddings = np.nan * np.zeros((batch_size, self.dimension))
+
         if masks is None:
-            # Обрабатываем весь батч сразу для ускорения
-            embeddings = self.session_.run(
-                output_names=["embs"], input_feed={"feats": features.numpy(force=True)}
-            )[0]
+            # Оптимизация для CUDA: используем io_binding если доступно
+            if self.device.type == "cuda" and hasattr(self, "session_"):
+                try:
+                    # Создаем io_binding для более эффективной передачи данных между CPU и GPU
+                    io_binding = self.session_.io_binding()
+                    
+                    # Преобразуем features в numpy
+                    features_np = features.numpy(force=True)
+                    
+                    # Создаем OrtValue из numpy массива
+                    features_ort = ort.OrtValue.ortvalue_from_numpy(features_np, "cuda", self.device.index or 0)
+                    
+                    # Привязываем входные и выходные данные
+                    io_binding.bind_ortvalue_input("feats", features_ort)
+                    io_binding.bind_output("embs", "cuda", self.device.index or 0)
+                    
+                    # Запускаем вывод
+                    self.session_.run_with_iobinding(io_binding)
+                    
+                    # Получаем результаты
+                    output_list = io_binding.get_outputs()
+                    embeddings = output_list[0].numpy()
+                except Exception as e:
+                    # В случае ошибки, используем стандартный подход
+                    warnings.warn(f"Error using io_binding: {e}. Falling back to standard run.")
+                    embeddings = self.session_.run(
+                        output_names=["embs"], input_feed={"feats": features.numpy(force=True)}
+                    )[0]
+            else:
+                # Стандартный вызов для CPU
+                embeddings = self.session_.run(
+                    output_names=["embs"], input_feed={"feats": features.numpy(force=True)}
+                )[0]
 
             return embeddings
 
+        # Код для обработки с масками остается без изменений
         batch_size_masks, _ = masks.shape
         assert batch_size == batch_size_masks
 
@@ -616,8 +657,6 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
         ).squeeze(dim=1)
 
         imasks = imasks > 0.5
-
-        embeddings = np.nan * np.zeros((batch_size, self.dimension))
         
         # Группируем примеры для батчевой обработки
         valid_indices = []
