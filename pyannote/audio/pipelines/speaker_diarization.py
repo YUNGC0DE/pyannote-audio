@@ -88,6 +88,8 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         When loading private huggingface.co models, set `use_auth_token`
         to True or to a string containing your hugginface.co authentication
         token that can be obtained by running `huggingface-cli login`
+    use_onnx : bool, optional
+        Use ONNX model for embedding extraction.
 
     Usage
     -----
@@ -119,10 +121,11 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         embedding: PipelineModel = "speechbrain/spkrec-ecapa-voxceleb@5c0be3875fda05e81f3c004ed8c7c06be308de1e",
         embedding_exclude_overlap: bool = False,
         clustering: str = "AgglomerativeClustering",
-        embedding_batch_size: int = 1,
-        segmentation_batch_size: int = 1,
+        embedding_batch_size: int = 32,
+        segmentation_batch_size: int = 32,
         der_variant: Optional[dict] = None,
         use_auth_token: Union[Text, None] = None,
+        use_onnx: bool = False,
     ):
         super().__init__()
 
@@ -134,6 +137,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         self.embedding = embedding
         self.embedding_batch_size = embedding_batch_size
         self.embedding_exclude_overlap = embedding_exclude_overlap
+        self.use_onnx = use_onnx
 
         self.klustering = clustering
 
@@ -163,6 +167,13 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
             metric = "not_applicable"
 
         else:
+            if self.use_onnx and isinstance(self.embedding, str) and "wespeaker" not in self.embedding:
+                if "speechbrain" in self.embedding:
+                    self.embedding = "hbredin/wespeaker-voxceleb-resnet34-LM"
+                    print(f"Using ONNX model: {self.embedding}")
+                elif "pyannote" in self.embedding:
+                    pass
+
             self._embedding = PretrainedSpeakerEmbedding(
                 self.embedding, use_auth_token=use_auth_token
             )
@@ -292,72 +303,78 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
                 binary_segmentations.data, binary_segmentations.sliding_window
             )
 
-        def iter_waveform_and_mask():
-            for (chunk, masks), (_, clean_masks) in zip(
-                binary_segmentations, clean_segmentations
-            ):
-                # chunk: Segment(t, t + duration)
-                # masks: (num_frames, local_num_speakers) np.ndarray
+        # Оптимизированная версия для более эффективной обработки батчей
+        # Предварительно подготавливаем все данные для батчевой обработки
+        all_waveforms = []
+        all_masks = []
+        chunk_speaker_indices = []  # Для отслеживания (chunk, speaker) индексов
 
-                waveform, _ = self._audio.crop(
-                    file,
-                    chunk,
-                    duration=duration,
-                    mode="pad",
-                )
-                # waveform: (1, num_samples) torch.Tensor
+        for c, ((chunk, masks), (_, clean_masks)) in enumerate(zip(
+            binary_segmentations, clean_segmentations
+        )):
+            # chunk: Segment(t, t + duration)
+            # masks: (num_frames, local_num_speakers) np.ndarray
 
-                # mask may contain NaN (in case of partial stitching)
-                masks = np.nan_to_num(masks, nan=0.0).astype(np.float32)
-                clean_masks = np.nan_to_num(clean_masks, nan=0.0).astype(np.float32)
+            waveform, _ = self._audio.crop(
+                file,
+                chunk,
+                duration=duration,
+                mode="pad",
+            )
+            # waveform: (1, num_samples) torch.Tensor
 
-                for mask, clean_mask in zip(masks.T, clean_masks.T):
-                    # mask: (num_frames, ) np.ndarray
+            # mask may contain NaN (in case of partial stitching)
+            masks = np.nan_to_num(masks, nan=0.0).astype(np.float32)
+            clean_masks = np.nan_to_num(clean_masks, nan=0.0).astype(np.float32)
 
-                    if np.sum(clean_mask) > min_num_frames:
-                        used_mask = clean_mask
-                    else:
-                        used_mask = mask
+            for s, (mask, clean_mask) in enumerate(zip(masks.T, clean_masks.T)):
+                # mask: (num_frames, ) np.ndarray
 
-                    yield waveform[None], torch.from_numpy(used_mask)[None]
-                    # w: (1, 1, num_samples) torch.Tensor
-                    # m: (1, num_frames) torch.Tensor
+                if np.sum(clean_mask) > min_num_frames:
+                    used_mask = clean_mask
+                else:
+                    used_mask = mask
 
-        batches = batchify(
-            iter_waveform_and_mask(),
-            batch_size=self.embedding_batch_size,
-            fillvalue=(None, None),
-        )
+                all_waveforms.append(waveform)
+                all_masks.append(torch.from_numpy(used_mask))
+                chunk_speaker_indices.append((c, s))
 
-        batch_count = math.ceil(num_chunks * num_speakers / self.embedding_batch_size)
-
-        embedding_batches = []
+        # Создаем батчи для обработки
+        total_items = len(all_waveforms)
+        batch_size = self.embedding_batch_size
+        batch_count = math.ceil(total_items / batch_size)
+        
+        # Инициализируем массив для хранения всех эмбеддингов
+        all_embeddings = np.zeros((total_items, self._embedding.dimension), dtype=np.float32)
+        all_embeddings.fill(np.nan)
 
         if hook is not None:
             hook("embeddings", None, total=batch_count, completed=0)
 
-        for i, batch in enumerate(batches, 1):
-            waveforms, masks = zip(*filter(lambda b: b[0] is not None, batch))
-
-            waveform_batch = torch.vstack(waveforms)
-            # (batch_size, 1, num_samples) torch.Tensor
-
-            mask_batch = torch.vstack(masks)
-            # (batch_size, num_frames) torch.Tensor
-
-            embedding_batch: np.ndarray = self._embedding(
-                waveform_batch, masks=mask_batch
-            )
-            # (batch_size, dimension) np.ndarray
-
-            embedding_batches.append(embedding_batch)
-
+        # Обрабатываем данные батчами
+        for i in range(batch_count):
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, total_items)
+            
+            batch_waveforms = torch.stack([w[None] for w in all_waveforms[start_idx:end_idx]])
+            batch_masks = torch.stack([m[None] for m in all_masks[start_idx:end_idx]])
+            
+            # Извлекаем эмбеддинги для текущего батча
+            batch_embeddings = self._embedding(batch_waveforms, masks=batch_masks)
+            
+            # Сохраняем результаты
+            all_embeddings[start_idx:end_idx] = batch_embeddings
+            
             if hook is not None:
-                hook("embeddings", embedding_batch, total=batch_count, completed=i)
+                hook("embeddings", batch_embeddings, total=batch_count, completed=i+1)
 
-        embedding_batches = np.vstack(embedding_batches)
-
-        embeddings = rearrange(embedding_batches, "(c s) d -> c s d", c=num_chunks)
+        # Реорганизуем эмбеддинги в формат (num_chunks, num_speakers, dimension)
+        embeddings = np.zeros((num_chunks, num_speakers, self._embedding.dimension), dtype=np.float32)
+        embeddings.fill(np.nan)
+        
+        for idx, (c, s) in enumerate(chunk_speaker_indices):
+            if not np.isnan(all_embeddings[idx][0]):  # Проверяем, что эмбеддинг был успешно извлечен
+                embeddings[c, s] = all_embeddings[idx]
 
         # caching embeddings for subsequent trials
         # (see comments at the top of this method for more details)

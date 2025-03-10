@@ -391,6 +391,16 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
         Path to WeSpeaker pretrained speaker embedding
     device : torch.device, optional
         Device
+    inter_op_num_threads : int, optional
+        Number of threads used to parallelize the execution of the graph (across nodes)
+    intra_op_num_threads : int, optional
+        Number of threads used to parallelize the execution of the graph (within nodes)
+    execution_mode : int, optional
+        ONNX Runtime execution mode (0: sequential, 1: parallel)
+    graph_optimization_level : int, optional
+        ONNX Runtime graph optimization level (0: disable, 1: basic, 2: extended, 99: all)
+    enable_profiling : bool, optional
+        Enable ONNX Runtime profiling
 
     Usage
     -----
@@ -411,6 +421,11 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
         self,
         embedding: Text = "hbredin/wespeaker-voxceleb-resnet34-LM",
         device: Optional[torch.device] = None,
+        inter_op_num_threads: int = 4,
+        intra_op_num_threads: int = 4,
+        execution_mode: int = 1,  # 0: sequential, 1: parallel
+        graph_optimization_level: int = 99,  # 0: disable, 1: basic, 2: extended, 99: all
+        enable_profiling: bool = False,
     ):
         if not ONNX_IS_AVAILABLE:
             raise ImportError(
@@ -431,6 +446,11 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
                 )
 
         self.embedding = embedding
+        self.inter_op_num_threads = inter_op_num_threads
+        self.intra_op_num_threads = intra_op_num_threads
+        self.execution_mode = execution_mode
+        self.graph_optimization_level = graph_optimization_level
+        self.enable_profiling = enable_profiling
 
         self.to(device or torch.device("cpu"))
 
@@ -452,8 +472,17 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
             providers = ["CPUExecutionProvider"]
 
         sess_options = ort.SessionOptions()
-        sess_options.inter_op_num_threads = 4
-        sess_options.intra_op_num_threads = 4
+        sess_options.inter_op_num_threads = self.inter_op_num_threads
+        sess_options.intra_op_num_threads = self.intra_op_num_threads
+        sess_options.execution_mode = ort.ExecutionMode.ORT_PARALLEL if self.execution_mode == 1 else ort.ExecutionMode.ORT_SEQUENTIAL
+        sess_options.graph_optimization_level = self.graph_optimization_level
+        sess_options.enable_profiling = self.enable_profiling
+        
+        # Включаем оптимизации для ускорения
+        sess_options.enable_cpu_mem_arena = True
+        sess_options.enable_mem_pattern = True
+        sess_options.enable_mem_reuse = True
+        
         self.session_ = ort.InferenceSession(
             self.embedding, sess_options=sess_options, providers=providers
         )
@@ -572,6 +601,7 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
         _, num_frames, _ = features.shape
 
         if masks is None:
+            # Обрабатываем весь батч сразу для ускорения
             embeddings = self.session_.run(
                 output_names=["embs"], input_feed={"feats": features.numpy(force=True)}
             )[0]
@@ -588,16 +618,36 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
         imasks = imasks > 0.5
 
         embeddings = np.nan * np.zeros((batch_size, self.dimension))
-
+        
+        # Группируем примеры для батчевой обработки
+        valid_indices = []
+        valid_features = []
+        
         for f, (feature, imask) in enumerate(zip(features, imasks)):
             masked_feature = feature[imask]
             if masked_feature.shape[0] < self.min_num_frames:
                 continue
-
-            embeddings[f] = self.session_.run(
-                output_names=["embs"],
-                input_feed={"feats": masked_feature.numpy(force=True)[None]},
-            )[0][0]
+                
+            valid_indices.append(f)
+            valid_features.append(masked_feature.numpy(force=True))
+        
+        if valid_features:
+            # Обрабатываем все валидные примеры за один вызов ONNX
+            # Паддинг до максимальной длины
+            max_len = max(feat.shape[0] for feat in valid_features)
+            padded_features = np.zeros((len(valid_features), max_len, features.shape[2]), dtype=np.float32)
+            
+            for i, feat in enumerate(valid_features):
+                padded_features[i, :feat.shape[0], :] = feat
+                
+            # Получаем эмбеддинги для всех валидных примеров
+            batch_embeddings = self.session_.run(
+                output_names=["embs"], input_feed={"feats": padded_features}
+            )[0]
+            
+            # Распределяем эмбеддинги по правильным индексам
+            for i, idx in enumerate(valid_indices):
+                embeddings[idx] = batch_embeddings[i]
 
         return embeddings
 
@@ -702,6 +752,7 @@ def PretrainedSpeakerEmbedding(
     embedding: PipelineModel,
     device: Optional[torch.device] = None,
     use_auth_token: Union[Text, None] = None,
+    **kwargs
 ):
     """Pretrained speaker embedding
 
@@ -716,6 +767,13 @@ def PretrainedSpeakerEmbedding(
         When loading private huggingface.co models, set `use_auth_token`
         to True or to a string containing your hugginface.co authentication
         token that can be obtained by running `huggingface-cli login`
+    **kwargs : dict, optional
+        Additional keyword arguments passed to the embedding model.
+        For ONNX models, these can include:
+        - inter_op_num_threads: int (default: 4)
+        - intra_op_num_threads: int (default: 4)
+        - execution_mode: int (default: 1, parallel)
+        - graph_optimization_level: int (default: 99, all optimizations)
 
     Usage
     -----
@@ -748,7 +806,7 @@ def PretrainedSpeakerEmbedding(
         return NeMoPretrainedSpeakerEmbedding(embedding, device=device)
 
     elif isinstance(embedding, str) and "wespeaker" in embedding:
-        return ONNXWeSpeakerPretrainedSpeakerEmbedding(embedding, device=device)
+        return ONNXWeSpeakerPretrainedSpeakerEmbedding(embedding, device=device, **kwargs)
 
     else:
         # fallback to pyannote in case we are loading a local model
