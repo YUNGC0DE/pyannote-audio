@@ -592,8 +592,8 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
 
         Parameters
         ----------
-        waveforms : (batch_size, num_channels, num_samples)
-            Only num_channels == 1 is supported.
+        waveforms : (batch_size, num_channels, num_samples) or (batch_size, num_samples)
+            Audio waveforms. If num_channels is not provided, assumes mono audio.
         masks : (batch_size, num_samples), optional
 
         Returns
@@ -601,9 +601,13 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
         embeddings : (batch_size, dimension)
 
         """
-
+        # Проверяем и нормализуем формат входных данных
+        if waveforms.ndim == 2:
+            # Если входные данные в формате (batch_size, num_samples)
+            waveforms = waveforms.unsqueeze(1)  # Добавляем канал
+        
         batch_size, num_channels, num_samples = waveforms.shape
-        assert num_channels == 1
+        assert num_channels == 1, f"Expected mono audio, got {num_channels} channels"
 
         features = self.compute_fbank(waveforms.to(self.device))
         _, num_frames, _ = features.shape
