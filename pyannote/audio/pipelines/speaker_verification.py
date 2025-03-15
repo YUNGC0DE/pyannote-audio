@@ -443,7 +443,17 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
         if device.type == "cpu":
             providers = ["CPUExecutionProvider"]
         elif device.type == "cuda":
-            providers = ["CUDAExecutionProvider"]
+            # Настраиваем провайдер CUDA с дополнительными опциями для предотвращения операций копирования
+            providers_options = [
+                {
+                    "device_id": device.index or 0,
+                    "arena_extend_strategy": "kNextPowerOfTwo",
+                    "gpu_mem_limit": 10 * 1024 * 1024 * 1024,
+                    "cudnn_conv_algo_search": "EXHAUSTIVE",
+                    "do_copy_in_default_stream": True,
+                }
+            ]
+            providers = [("CUDAExecutionProvider", providers_options[0])]
         else:
             warnings.warn(
                 f"Unsupported device type: {device.type}, falling back to CPU"
@@ -455,10 +465,18 @@ class ONNXWeSpeakerPretrainedSpeakerEmbedding(BaseInference):
         sess_options.intra_op_num_threads = 8  
         sess_options.inter_op_num_threads = 1
 
+        # Более детальные настройки для оптимизации
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         sess_options.enable_mem_pattern = True
         sess_options.enable_cpu_mem_arena = True
+        
+        # Добавляем логирование для диагностики, если нужно
+        sess_options.log_severity_level = 1
+        
+        # Настройки для уменьшения узлов memcpy
+        sess_options.add_session_config_entry("session.disable_prepacking", "1")
+        sess_options.add_session_config_entry("session.use_memory_efficient_gradient", "1")
 
         self.session_ = ort.InferenceSession(
             self.embedding, sess_options=sess_options, providers=providers
